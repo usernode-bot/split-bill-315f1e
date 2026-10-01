@@ -88,13 +88,20 @@ tables you've marked private), etc.
 
 ## About Split Bill
 
-Split bills with friends, track who paid and who owes.
-
-_(add a sentence or two more of product context here so Claude Code has a
-shared understanding of what this app is for)_
+Split bills with friends: each bill records who paid, how the total splits
+evenly across the friends named on it, and which friends have settled up.
+The bill list, bill detail (with per-friend mark-paid toggles) and the
+add-bill form are the whole product.
 
 ## App-specific conventions
 
-_(optional — e.g. "all currency values stored as integer cents, not
-floats"; "the `posts` table is append-only"; "avoid adding new
-dependencies"; etc.)_
+- All currency values are stored as **integer cents** (`total_cents`,
+  `share_cents`), never floats. Splits use floor division and hand the
+  leftover cents (at most one per person) to the first names on the
+  participant list, so shares always sum back to the total.
+- `bills` and `bill_shares` are marked `staging:private` — bills are
+  per-user financial data. Staging previews get schema only; use the
+  `?demo=1` request-time fixtures (in-memory, ids below zero) for test
+  data instead of boot-time seeding.
+- No new npm dependencies; the frontend is vanilla JS in `public/app.js`
+  with pathname routing (`/`, `/bill/:id`, `/add`).
