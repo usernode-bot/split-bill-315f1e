@@ -6,6 +6,7 @@ const jwt = require('jsonwebtoken');
 const app = express();
 const port = process.env.PORT || 3000;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const IS_STAGING = process.env.USERNODE_ENV === 'staging';
 
 // The platform signs user-identity tokens with an RSA private key it never
 // shares. Containers get only the PUBLIC half, so this app can verify who a
@@ -100,7 +101,102 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+// ---------------------------------------------------------------------------
+// Split Bill — bills and their per-person shares.
+//
+// Amounts live as integer cents (`*_cents` columns), never floats. Bills are
+// per-user (only the creator sees them), so both tables are marked
+// `staging:private`: staging clones get the schema without anyone's rows.
+// ---------------------------------------------------------------------------
+
+const MAX_PARTICIPANTS = 20;
+const MAX_NAME_LENGTH = 60;
+const MAX_TITLE_LENGTH = 200;
+const MAX_TOTAL_CENTS = 100000000; // $1,000,000.00
+
+// "42", "42.5" and "42.75" are accepted; anything else is not an amount.
+function amountToCents(raw) {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim().replace(/^\$/, '');
+  const m = /^(\d+)(?:\.(\d{1,2}))?$/.exec(s);
+  if (!m) return null;
+  const cents = parseInt(m[1], 10) * 100 + (m[2] ? parseInt((m[2] + '00').slice(0, 2), 10) : 0);
+  if (cents <= 0 || cents > MAX_TOTAL_CENTS) return null;
+  return cents;
+}
+
+// Split `total` cents evenly across `n` people, handing the spare cents
+// (at most n-1) to the first people on the list so the shares always sum
+// back to the total.
+function splitEvenly(total, n) {
+  const base = Math.floor(total / n);
+  const remainder = total % n;
+  const shares = [];
+  for (let i = 0; i < n; i++) shares.push(base + (i < remainder ? 1 : 0));
+  return shares;
+}
+
+// Request-time demo injection (staging previews only). The demo bills exist
+// only inside these responses — nothing is written to the database, so the
+// plain route still answers exactly what production would.
+const DEMO_BILLS = [
+  {
+    id: -1,
+    title: 'Staging demo: Pizza night',
+    total_cents: 4860,
+    payer: 'Alex',
+    created_at: '2026-09-27T18:30:00.000Z',
+    shares: [
+      { id: -11, username: 'Alex', share_cents: 1620, is_payer: true, paid: true },
+      { id: -12, username: 'Sam', share_cents: 1620, is_payer: false, paid: true },
+      { id: -13, username: 'Jordan', share_cents: 1620, is_payer: false, paid: false },
+    ],
+  },
+  {
+    id: -2,
+    title: 'Staging demo: Movie tickets',
+    total_cents: 3600,
+    payer: 'Sam',
+    created_at: '2026-09-30T20:00:00.000Z',
+    shares: [
+      { id: -21, username: 'Sam', share_cents: 1200, is_payer: true, paid: true },
+      { id: -22, username: 'Alex', share_cents: 1200, is_payer: false, paid: false },
+      { id: -23, username: 'Jordan', share_cents: 1200, is_payer: false, paid: false },
+    ],
+  },
+];
+
+function demoEnabled(req) {
+  return IS_STAGING && req.query.demo === '1';
+}
+
+function demoBillMeta(bill) {
+  return {
+    id: bill.id,
+    title: bill.title,
+    total_cents: bill.total_cents,
+    payer: bill.payer,
+    created_at: bill.created_at,
+    owed_count: bill.shares.filter((s) => !s.is_payer).length,
+    paid_count: bill.shares.filter((s) => !s.is_payer && s.paid).length,
+  };
+}
+
+const BILL_LIST_SQL = `
+  SELECT b.id, b.title, b.total_cents, b.payer, b.created_at,
+         COUNT(*) FILTER (WHERE NOT s.is_payer)::int AS owed_count,
+         COUNT(*) FILTER (WHERE NOT s.is_payer AND s.paid)::int AS paid_count
+  FROM bills b
+  LEFT JOIN bill_shares s ON s.bill_id = b.id
+  WHERE b.user_id = $1
+  GROUP BY b.id
+  ORDER BY b.created_at DESC, b.id DESC
+`;
+
+app.get('/health', (_req, res) => {
+  if (shuttingDown) return res.status(503).json({ status: 'shutting-down' });
+  res.json({ status: 'ok' });
+});
 
 // The template ships no favicon file; index.html carries an inline SVG
 // icon instead. Answer 204 here so anything that still probes
@@ -109,35 +205,166 @@ app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 // fresh load.
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
-// Button press
-app.post('/api/press', async (req, res) => {
+// List the signed-in user's bills (newest first), each with how many of the
+// non-payer shares are settled so the list card can show progress.
+app.get('/api/bills', async (req, res) => {
   try {
-    await pool.query(`
-      INSERT INTO presses (user_id, username) VALUES ($1, $2)
-    `, [req.user.id, req.user.username]);
-    res.json({ ok: true });
+    const { rows } = await pool.query(BILL_LIST_SQL, [req.user.id]);
+    if (demoEnabled(req)) {
+      return res.json({ bills: rows.concat(DEMO_BILLS.map(demoBillMeta)), demo: true });
+    }
+    res.json({ bills: rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Leaderboard
-app.get('/api/leaderboard', async (_req, res) => {
+// Create a bill: title, total and who paid, split equally across the named
+// friends. The payer gets a settled share row; everyone else starts owing.
+app.post('/api/bills', async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT username, COUNT(*) as presses
-      FROM presses
-      GROUP BY username
-      ORDER BY presses DESC
-      LIMIT 50
-    `);
-    res.json({ leaderboard: rows });
+    const body = req.body || {};
+    const title = typeof body.title === 'string' ? body.title.trim() : '';
+    if (title.length < 3) return res.status(400).json({ error: 'Title needs at least 3 characters.' });
+    if (title.length > MAX_TITLE_LENGTH) {
+      return res.status(400).json({ error: 'Title is too long (200 characters max).' });
+    }
+
+    const cents = amountToCents(body.amount);
+    if (cents === null) return res.status(400).json({ error: 'Enter an amount greater than zero.' });
+
+    const rawNames = Array.isArray(body.participants) ? body.participants : [];
+    const byKey = new Map();
+    for (const entry of rawNames) {
+      if (typeof entry !== 'string') continue;
+      const name = entry.trim().replace(/\s+/g, ' ');
+      if (!name) continue;
+      if (name.length > MAX_NAME_LENGTH) {
+        return res.status(400).json({ error: 'Names must be 60 characters or fewer.' });
+      }
+      const key = name.toLowerCase();
+      if (!byKey.has(key)) byKey.set(key, name);
+    }
+    const participants = [...byKey.values()];
+    if (participants.length < 2) return res.status(400).json({ error: 'Add at least two friends.' });
+    if (participants.length > MAX_PARTICIPANTS) {
+      return res.status(400).json({ error: 'A bill can have at most 20 people.' });
+    }
+
+    const payerKey = typeof body.payer === 'string' ? body.payer.trim().toLowerCase() : '';
+    if (!byKey.has(payerKey)) {
+      return res.status(400).json({ error: 'Pick who paid from the friends list.' });
+    }
+    const payer = byKey.get(payerKey);
+    const payerIndex = participants.findIndex((n) => n.toLowerCase() === payerKey);
+    const shares = splitEvenly(cents, participants.length);
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const billResult = await client.query(
+        `INSERT INTO bills (user_id, title, total_cents, payer)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, title, total_cents, payer, created_at`,
+        [req.user.id, title, cents, payer]
+      );
+      const bill = billResult.rows[0];
+      const values = [];
+      const params = [];
+      participants.forEach((name, i) => {
+        const o = params.length;
+        values.push(`($${o + 1}, $${o + 2}, $${o + 3}, $${o + 4}, $${o + 5})`);
+        params.push(bill.id, name, shares[i], i === payerIndex, i === payerIndex);
+      });
+      await client.query(
+        `INSERT INTO bill_shares (bill_id, username, share_cents, is_payer, paid)
+         VALUES ${values.join(', ')}`,
+        params
+      );
+      const shareRows = await client.query(
+        `SELECT id, username, share_cents, is_payer, paid FROM bill_shares WHERE bill_id = $1 ORDER BY id`,
+        [bill.id]
+      );
+      await client.query('COMMIT');
+      res.status(201).json({ bill, shares: shareRows.rows });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
+// One bill with its per-person split, payer first in the shares list.
+app.get('/api/bills/:id', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  try {
+    if (demoEnabled(req) && id < 0) {
+      const demo = DEMO_BILLS.find((b) => b.id === id);
+      if (!demo) return res.status(404).json({ error: 'Bill not found.' });
+      return res.json({
+        bill: { id, title: demo.title, total_cents: demo.total_cents, payer: demo.payer, created_at: demo.created_at },
+        shares: demo.shares,
+        demo: true,
+      });
+    }
+    const { rows } = await pool.query(
+      `SELECT id, title, total_cents, payer, created_at FROM bills WHERE id = $1 AND user_id = $2`,
+      [id, req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Bill not found.' });
+    const shareRows = await pool.query(
+      `SELECT id, username, share_cents, is_payer, paid FROM bill_shares WHERE bill_id = $1 ORDER BY id`,
+      [id]
+    );
+    res.json({ bill: rows[0], shares: shareRows.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Mark a friend's share as paid (or undo it). The payer's own share is not
+// toggleable — they paid the bill, nobody owes them their own share.
+app.post('/api/bills/:id/shares/:shareId/toggle', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const shareId = parseInt(req.params.shareId, 10);
+  if (demoEnabled(req) && id < 0 && shareId < 0) {
+    const demo = DEMO_BILLS.find((b) => b.id === id);
+    const share = demo && demo.shares.find((s) => s.id === shareId);
+    if (!share) return res.status(404).json({ error: 'Share not found.' });
+    if (share.is_payer) return res.status(400).json({ error: 'The payer does not owe a share.' });
+    // Flip a copy for the response only: demo state never persists anywhere.
+    return res.json({ share: { ...share, paid: !share.paid } });
+  }
+  try {
+    const owned = await pool.query(
+      `SELECT s.id, s.is_payer
+       FROM bill_shares s
+       JOIN bills b ON b.id = s.bill_id
+       WHERE s.id = $1 AND s.bill_id = $2 AND b.user_id = $3`,
+      [shareId, id, req.user.id]
+    );
+    if (!owned.rows.length) return res.status(404).json({ error: 'Share not found.' });
+    if (owned.rows[0].is_payer) return res.status(400).json({ error: 'The payer does not owe a share.' });
+    const { rows } = await pool.query(
+      `UPDATE bill_shares SET paid = NOT paid WHERE id = $1
+       RETURNING id, username, share_cents, is_payer, paid`,
+      [shareId]
+    );
+    res.json({ share: rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// `index: false` keeps the directory index off so an unauthenticated visit
+// to `/` falls through to the gated HTML handler below instead of the shell
+// being served straight off the static middleware. Real assets (JS, CSS)
+// still come from here.
+app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 
 // HTML shell: serve the app if authenticated. Unauthenticated top-level
 // visits (share links pasted into a browser — Sec-Fetch-Dest: document)
@@ -174,18 +401,74 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+let shuttingDown = false;
+
 async function start() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS presses (
+    CREATE TABLE IF NOT EXISTS bills (
       id SERIAL PRIMARY KEY,
       user_id INTEGER NOT NULL,
-      username VARCHAR(255) NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW()
+      title VARCHAR(200) NOT NULL,
+      total_cents INTEGER NOT NULL,
+      payer VARCHAR(60) NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS bills_user_idx ON bills (user_id, created_at DESC)`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bill_shares (
+      id SERIAL PRIMARY KEY,
+      bill_id INTEGER NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+      username VARCHAR(60) NOT NULL,
+      share_cents INTEGER NOT NULL,
+      is_payer BOOLEAN NOT NULL DEFAULT FALSE,
+      paid BOOLEAN NOT NULL DEFAULT FALSE
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS bill_shares_bill_idx ON bill_shares (bill_id)`);
+  // Bills belong to one person and hold who they lent money to, so a
+  // stranger reading every row would see private financial detail. Staging
+  // clones get the schema only; previews use the ?demo=1 fixtures instead.
+  await pool.query(`COMMENT ON TABLE bills IS 'staging:private'`);
+  await pool.query(`COMMENT ON TABLE bill_shares IS 'staging:private'`);
+  // The starter template's demo table goes away with the template screen.
+  await pool.query(`DROP TABLE IF EXISTS presses`);
+
   const server = app.listen(port, () => console.log(`Listening on :${port}`));
   // Let Envoy retire idle upstream connections at 60s, with a 15s margin.
   server.keepAliveTimeout = 75_000;
+
+  // The platform stops and replaces this container on every deploy with a
+  // bounded grace period: stop accepting connections, drain in-flight
+  // requests, close the pool, exit. Idempotent so a second signal is a no-op.
+  return server;
 }
 
-start().catch(err => { console.error(err); process.exit(1); });
+const DRAIN_MS = 3000;
+let currentServer = null;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] ${signal} received, draining`);
+  if (currentServer) {
+    currentServer.close(() => {});
+    currentServer.closeIdleConnections?.();
+    const t = setTimeout(() => currentServer.closeAllConnections?.(), DRAIN_MS);
+    t.unref?.();
+  }
+  try {
+    await pool.end();
+  } catch (err) {
+    console.error('[shutdown] pool.end failed', err.message);
+  }
+  process.exit(0);
+}
+
+start()
+  .then((server) => {
+    currentServer = server;
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+  })
+  .catch(err => { console.error(err); process.exit(1); });

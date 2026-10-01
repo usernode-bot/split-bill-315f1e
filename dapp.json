@@ -1,4 +1,34 @@
 {
   "description": "Split bills with friends, track who paid and who owes.",
-  "secrets": []
+  "tests": [
+    {
+      "id": "bills.list",
+      "name": "Bill list renders",
+      "path": "/",
+      "expectSelector": "#view",
+      "expectText": "No bills yet",
+      "visual": true,
+      "impact": ["public/index.html", "public/app.js", "server.js", "styles/**", "tailwind.config.js"]
+    },
+    {
+      "id": "bills.demo-list",
+      "name": "Demo bills render in preview",
+      "path": "/?demo=1",
+      "expectSelector": ".bill-card",
+      "expectText": "Staging demo"
+    },
+    {
+      "id": "bills.detail-demo",
+      "name": "Bill detail with mark-paid toggles renders",
+      "path": "/bill/-1?demo=1",
+      "expectText": "paid the bill"
+    },
+    {
+      "id": "bills.add-form",
+      "name": "Add bill form renders",
+      "path": "/add",
+      "expectSelector": "#add-form",
+      "expectText": "Paid by"
+    }
+  ]
 }
