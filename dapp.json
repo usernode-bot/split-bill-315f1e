@@ -1,4 +1,5 @@
 {
+  "icon": { "emoji": "🧾" },
   "description": "Split bills with friends, track who paid and who owes.",
   "tests": [
     {
