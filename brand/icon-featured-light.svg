@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <!-- Split Bill featured artwork, light version: the app icon's mark on cream.
+       Palette: #FFFEEA (background, line items), #000000 (receipt).
+       Same paths as brand/icon.svg, scaled to 640px tall and centred. -->
+  <rect x="0" y="0" width="1600" height="900" fill="#FFFEEA"/>
+  <g transform="translate(291.18 -80.68) scale(0.99379)">
+    <path d="M272 212 H484 V780 L457 816 L431 780 L404 816 L378 780 L351 816 L325 780 L298 816 L272 780 Z" fill="#000000"/>
+    <path d="M540 252 H752 V820 L725 856 L699 820 L672 856 L646 820 L619 856 L593 820 L566 856 L540 820 Z" fill="#000000"/>
+    <rect x="316" y="300" width="124" height="44" rx="22" fill="#FFFEEA"/>
+    <rect x="316" y="396" width="84" height="44" rx="22" fill="#FFFEEA"/>
+    <rect x="584" y="340" width="124" height="44" rx="22" fill="#FFFEEA"/>
+    <rect x="584" y="436" width="84" height="44" rx="22" fill="#FFFEEA"/>
+  </g>
+</svg>
