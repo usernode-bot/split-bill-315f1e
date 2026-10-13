@@ -3,6 +3,12 @@
 Split bills with friends: record who paid, how a bill splits, and who has
 settled up.
 
+- **Icon** — the app tile is a cream receipt split in two on black
+  (`brand/icon.png`, with the SVG source next to it), plus light and dark
+  featured artwork (`brand/icon-featured-light.png`,
+  `brand/icon-featured-dark.png`). See `brand/ICON.md`.
+
+
 - **Bill list** — every bill with its title, total, who paid and the date,
   plus a "x of y paid" progress badge that flips to "Settled".
 - **Bill detail** — the equal split per person: the payer's row, what each
